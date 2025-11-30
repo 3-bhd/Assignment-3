@@ -1,0 +1,10 @@
+program main {
+    int x;
+    int y;
+    x = 5;
+    y = 0;
+    if (x > 3) 
+        y = 10;
+    else
+        y = 20;
+}

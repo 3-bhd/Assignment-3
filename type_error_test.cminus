@@ -1,0 +1,6 @@
+program main {
+    int x;
+    float y;
+    x = 5;
+    y = x + 3.5;
+}
