@@ -6,30 +6,97 @@
 #include "tokens.h"
 #include "symbol_table.h"
 
-/* ---- externs coming from lex.yy.c (scanner) ---- */
+/* External scanner definitions */
 extern int   yylex(void);
 extern char *yytext;
 extern FILE *yyin;
-
-/* Line counter is defined in scanner.l */
 extern int line;
 
 /* Current lookahead token */
 static int lookahead;
 
-/* ======== Helper structs for expression values ======== */
-
+/* ------------------------------------------
+   ExprVal = runtime value for evaluating Expr
+------------------------------------------- */
 typedef struct {
     VarType type;
-    float   fval;   /* we store both int and float numerically as float */
+    float   fval;
 } ExprVal;
 
-/* ======== Error handling & parsing utilities ======== */
+/* ------------------------------------------
+   AST Definitions
+------------------------------------------- */
+
+typedef struct Expr Expr;
+typedef struct Stmt Stmt;
+
+typedef enum {
+    EXPR_VAR,
+    EXPR_NUM,
+    EXPR_BINOP
+} ExprKind;
+
+typedef enum {
+    OP_ADD, OP_SUB, OP_MUL, OP_DIV,
+    OP_EQ, OP_NEQ, OP_LT, OP_LTE, OP_GT, OP_GTE
+} BinOpKind;
+
+struct Expr {
+    ExprKind kind;
+    VarType  type;
+    union {
+        struct { char *name; } var;
+        struct { float value; } num;
+        struct {
+            BinOpKind op;
+            Expr *left;
+            Expr *right;
+        } bin;
+    } u;
+};
+
+typedef enum {
+    STMT_ASSIGN,
+    STMT_IF,
+    STMT_WHILE,
+    STMT_BLOCK,
+    STMT_EMPTY
+} StmtKind;
+
+struct Stmt {
+    StmtKind kind;
+    Stmt *next;         /* linked list for statement lists */
+
+    union {
+        struct {
+            char *name;
+            Expr *expr;
+        } assign;
+
+        struct {
+            Expr *cond;
+            Stmt *then_branch;
+            Stmt *else_branch;
+        } sel;
+
+        struct {
+            Expr *cond;
+            Stmt *body;
+        } wh;
+
+        struct {
+            Stmt *body;
+        } block;
+
+    } u;
+};
+
+/* ----------------- Parsing Helpers ----------------- */
 
 static void syntax_error(const char *expected) {
     fprintf(stderr,
-            "Syntax error at line %d: expected %s, found %s ('%s')\n",
-            line, expected, token_name(lookahead), yytext);
+        "Syntax error at line %d: expected %s but found '%s'\n",
+        line, expected, yytext);
     exit(EXIT_FAILURE);
 }
 
@@ -38,425 +105,500 @@ static void advance(void) {
 }
 
 static void match(int expected) {
-    if (lookahead == expected) {
-        advance();
-    } else {
-        char buf[64];
-        snprintf(buf, sizeof(buf), "'%s'", token_name(expected));
-        syntax_error(buf);
+    if (lookahead == expected) advance();
+    else {
+        syntax_error(token_name(expected));
     }
 }
 
-/* Forward declarations for nonterminals */
-static void program_(void);
-static void declaration_list(void);
-static void declaration(void);
-static VarType type_specifier(void);
-static void statement_list(int exec);
-static void statement(int exec);
-static void compound_stmt(int exec);
-static void assignment_stmt(int exec);
-static void selection_stmt(int exec);
-static void iteration_stmt(int exec);
-static void expression(ExprVal *out);
-static void additive_expression(ExprVal *out);
-static void term(ExprVal *out);
-static void factor(ExprVal *out);
-
-/* Utility: require that two ExprVal have the same type */
 static void ensure_same_type(const ExprVal *a, const ExprVal *b) {
     if (a->type != b->type) {
-        semantic_error("Type mismatch: operands are not the same type");
+        semantic_error("Type mismatch in expression");
     }
 }
 
-/* Convert ExprVal to boolean (0 or 1) for conditions */
 static int expr_to_bool(const ExprVal *e) {
-    /* We treat zero as false, non-zero as true, regardless of type */
     return (e->fval != 0.0f);
 }
 
-/* ======== Grammar implementation ======== */
+/* Forward declarations */
+static void program_();
+static void declaration_list();
+static void declaration();
+static VarType type_specifier();
 
-/* program → program ID { declaration-list statement-list } */
-static void program_(void) {
-    if (lookahead != T_PROGRAM) {
-        syntax_error("'program'");
+static Stmt *statement_list();
+static Stmt *statement();
+static Stmt *compound_stmt();
+static Stmt *assignment_stmt();
+static Stmt *selection_stmt();
+static Stmt *iteration_stmt();
+
+static Expr *expression();
+static Expr *additive_expression();
+static Expr *term();
+static Expr *factor();
+
+/* Execution functions */
+static void exec_stmt_list(Stmt *s);
+static void exec_stmt(Stmt *s);
+static void eval_expr(const Expr *e, ExprVal *out);
+
+/* --------------- AST Constructors --------------- */
+
+static Expr *make_var_expr(const char *name) {
+    Expr *e = malloc(sizeof(Expr));
+    e->kind = EXPR_VAR;
+    Symbol *sym = st_lookup(name);
+    e->type = sym->type;
+    e->u.var.name = strdup(name);
+    return e;
+}
+
+static Expr *make_num_expr(VarType t, float value) {
+    Expr *e = malloc(sizeof(Expr));
+    e->kind = EXPR_NUM;
+    e->type = t;
+    e->u.num.value = value;
+    return e;
+}
+
+static Expr *make_binop_expr(BinOpKind op, VarType type, Expr *l, Expr *r) {
+    Expr *e = malloc(sizeof(Expr));
+    e->kind = EXPR_BINOP;
+    e->type = type;
+    e->u.bin.op = op;
+    e->u.bin.left = l;
+    e->u.bin.right = r;
+    return e;
+}
+
+static Stmt *alloc_stmt(StmtKind k) {
+    Stmt *s = malloc(sizeof(Stmt));
+    s->kind = k;
+    s->next = NULL;
+    return s;
+}
+
+static Stmt *make_empty_stmt() {
+    return alloc_stmt(STMT_EMPTY);
+}
+
+static Stmt *make_assign_stmt(const char *name, Expr *expr) {
+    Stmt *s = alloc_stmt(STMT_ASSIGN);
+    s->u.assign.name = strdup(name);
+    s->u.assign.expr = expr;
+    return s;
+}
+
+static Stmt *make_if_stmt(Expr *cond, Stmt *t, Stmt *e) {
+    Stmt *s = alloc_stmt(STMT_IF);
+    s->u.sel.cond = cond;
+    s->u.sel.then_branch = t;
+    s->u.sel.else_branch = e;
+    return s;
+}
+
+static Stmt *make_while_stmt(Expr *cond, Stmt *body) {
+    Stmt *s = alloc_stmt(STMT_WHILE);
+    s->u.wh.cond = cond;
+    s->u.wh.body = body;
+    return s;
+}
+
+static Stmt *make_block_stmt(Stmt *body) {
+    Stmt *s = alloc_stmt(STMT_BLOCK);
+    s->u.block.body = body;
+    return s;
+}
+
+/* ------------------ EXECUTION ------------------ */
+
+static void eval_expr(const Expr *e, ExprVal *out) {
+    switch (e->kind) {
+    case EXPR_NUM:
+        out->type = e->type;
+        out->fval = e->u.num.value;
+        break;
+
+    case EXPR_VAR: {
+        Symbol *sym = st_lookup(e->u.var.name);
+        out->type = sym->type;
+        if (sym->type == TYPE_INT)
+            out->fval = st_get_int(sym);
+        else
+            out->fval = st_get_float(sym);
+        break;
     }
+
+    case EXPR_BINOP: {
+        ExprVal l, r;
+        eval_expr(e->u.bin.left, &l);
+        eval_expr(e->u.bin.right, &r);
+
+        /* Relational? */
+        if (e->u.bin.op == OP_EQ || e->u.bin.op == OP_NEQ ||
+            e->u.bin.op == OP_LT || e->u.bin.op == OP_LTE ||
+            e->u.bin.op == OP_GT || e->u.bin.op == OP_GTE) {
+
+            ensure_same_type(&l, &r);
+
+            out->type = TYPE_INT;
+            switch (e->u.bin.op) {
+                case OP_EQ:  out->fval = (l.fval == r.fval); break;
+                case OP_NEQ: out->fval = (l.fval != r.fval); break;
+                case OP_LT:  out->fval = (l.fval <  r.fval); break;
+                case OP_LTE: out->fval = (l.fval <= r.fval); break;
+                case OP_GT:  out->fval = (l.fval >  r.fval); break;
+                case OP_GTE: out->fval = (l.fval >= r.fval); break;
+                default: semantic_error("Invalid relational op");
+            }
+        }
+        /* Arithmetic */
+        else {
+            ensure_same_type(&l, &r);
+            out->type = l.type;
+
+            switch (e->u.bin.op) {
+                case OP_ADD: out->fval = l.fval + r.fval; break;
+                case OP_SUB: out->fval = l.fval - r.fval; break;
+                case OP_MUL: out->fval = l.fval * r.fval; break;
+                case OP_DIV:
+                    if (r.fval == 0.0f) semantic_error("Division by zero");
+                    out->fval = l.fval / r.fval;
+                    break;
+                default: semantic_error("Invalid arithmetic op");
+            }
+        }
+        break;
+    }
+    }
+}
+
+static void exec_stmt_list(Stmt *s) {
+    while (s) {
+        exec_stmt(s);
+        s = s->next;
+    }
+}
+
+static void exec_stmt(Stmt *s) {
+
+    if (!s) return;
+
+    switch (s->kind) {
+
+    case STMT_EMPTY:
+        break;
+
+    case STMT_ASSIGN: {
+        ExprVal v;
+        eval_expr(s->u.assign.expr, &v);
+
+        Symbol *sym = st_lookup(s->u.assign.name);
+        if (sym->type != v.type)
+            semantic_error("Type mismatch in assignment");
+
+        if (v.type == TYPE_INT)
+            st_set_int(sym, (int)v.fval);
+        else
+            st_set_float(sym, v.fval);
+
+        break;
+    }
+
+    case STMT_IF: {
+        ExprVal cond;
+        eval_expr(s->u.sel.cond, &cond);
+        if (expr_to_bool(&cond))
+            exec_stmt_list(s->u.sel.then_branch);
+        else if (s->u.sel.else_branch)
+            exec_stmt_list(s->u.sel.else_branch);
+        break;
+    }
+
+    case STMT_WHILE: {
+        while (1) {
+            ExprVal cond;
+            eval_expr(s->u.wh.cond, &cond);
+            if (!expr_to_bool(&cond)) break;
+            exec_stmt_list(s->u.wh.body);
+        }
+        break;
+    }
+
+    case STMT_BLOCK:
+        exec_stmt_list(s->u.block.body);
+        break;
+
+    }
+}
+
+/* ------------------ PARSING ------------------ */
+
+static void program_() {
     match(T_PROGRAM);
-
-    if (lookahead != T_ID) {
-        syntax_error("program identifier");
-    }
-    /* We don't need to store the program name; just consume it. */
     match(T_ID);
-
     match(T_LBRACE);
+
     declaration_list();
-    statement_list(/*exec=*/1);
+    Stmt *body = statement_list();
+
     match(T_RBRACE);
+
+    exec_stmt_list(body);
 }
 
-/* declaration-list → { declaration } */
-static void declaration_list(void) {
-    while (lookahead == T_INT || lookahead == T_FLOAT) {
+static void declaration_list() {
+    while (lookahead == T_INT || lookahead == T_FLOAT)
         declaration();
-    }
 }
 
-/* declaration → type-specifier ID ; */
-static void declaration(void) {
+static void declaration() {
     VarType t = type_specifier();
 
-    if (lookahead != T_ID) {
+    if (lookahead != T_ID)
         syntax_error("identifier");
-    }
-    char name[64];
-    /* yytext contains the current lexeme for lookahead */
-    strncpy(name, yytext, sizeof(name) - 1);
-    name[sizeof(name) - 1] = '\0';
 
+    char name[64];
+    strcpy(name, yytext);
     match(T_ID);
     match(T_SEMI);
 
-    /* Insert into symbol table */
     st_insert(name, t, line);
 }
 
-/* type-specifier → int | float */
-static VarType type_specifier(void) {
+static VarType type_specifier() {
     if (lookahead == T_INT) {
         match(T_INT);
         return TYPE_INT;
-    } else if (lookahead == T_FLOAT) {
+    }
+    if (lookahead == T_FLOAT) {
         match(T_FLOAT);
         return TYPE_FLOAT;
-    } else {
-        syntax_error("type specifier (int or float)");
-        return TYPE_INT; /* unreachable */
     }
+    syntax_error("type");
+    return TYPE_INT;
 }
 
-/* statement-list → { statement } */
-static void statement_list(int exec) {
-    while (lookahead == T_ID     ||
-           lookahead == T_IF     ||
-           lookahead == T_WHILE  ||
-           lookahead == T_LBRACE ||
+static Stmt *statement_list() {
+    Stmt *head = NULL, *tail = NULL;
+
+    while (lookahead == T_ID || lookahead == T_IF ||
+           lookahead == T_WHILE || lookahead == T_LBRACE ||
            lookahead == T_SEMI) {
-        statement(exec);
+
+        Stmt *s = statement();
+
+        if (!head) head = tail = s;
+        else {
+            tail->next = s;
+            while (tail->next) tail = tail->next;
+        }
     }
+    return head;
 }
 
-/* statement → assignment-stmt | selection-stmt | iteration-stmt
- *           | compound-stmt | ;   (empty statement)
- */
-static void statement(int exec) {
-    switch (lookahead) {
-        case T_ID:
-            assignment_stmt(exec);
-            break;
-        case T_IF:
-            selection_stmt(exec);
-            break;
-        case T_WHILE:
-            iteration_stmt(exec);
-            break;
-        case T_LBRACE:
-            compound_stmt(exec);
-            break;
-        case T_SEMI:
-            /* Empty statement */
-            match(T_SEMI);
-            break;
-        default:
-            syntax_error("statement");
+static Stmt *statement() {
+
+    if (lookahead == T_ID) return assignment_stmt();
+    if (lookahead == T_IF) return selection_stmt();
+    if (lookahead == T_WHILE) return iteration_stmt();
+    if (lookahead == T_LBRACE) return compound_stmt();
+    if (lookahead == T_SEMI) {
+        match(T_SEMI);
+        return make_empty_stmt();
     }
+
+    syntax_error("statement");
+    return NULL;
 }
 
-/* compound-stmt → { statement-list } */
-static void compound_stmt(int exec) {
+static Stmt *compound_stmt() {
     match(T_LBRACE);
-    statement_list(exec);
+    Stmt *b = statement_list();
     match(T_RBRACE);
+    return make_block_stmt(b);
 }
 
-/* assignment-stmt → ID = expression ; */
-static void assignment_stmt(int exec) {
-    if (lookahead != T_ID) {
-        syntax_error("identifier at start of assignment");
-    }
-
+static Stmt *assignment_stmt() {
     char name[64];
-    strncpy(name, yytext, sizeof(name) - 1);
-    name[sizeof(name) - 1] = '\0';
-
+    strcpy(name, yytext);
     match(T_ID);
+
     match(T_ASSIGN);
-
-    ExprVal rhs;
-    expression(&rhs);
-
+    Expr *rhs = expression();
     match(T_SEMI);
 
-    if (!exec) {
-        /* We are in a "skipped" branch – just parse, no side effects */
-        return;
-    }
-
-    /* Look up variable and assign */
-    Symbol *sym = st_lookup(name);
-    if (sym->type != rhs.type) {
-        semantic_error("Type mismatch in assignment to '%s'", name);
-    }
-
-    if (rhs.type == TYPE_INT) {
-        st_set_int(sym, (int)rhs.fval);
-    } else {
-        st_set_float(sym, rhs.fval);
-    }
+    return make_assign_stmt(name, rhs);
 }
 
-/* selection-stmt → if ( expression ) statement [ else statement ] */
-static void selection_stmt(int exec) {
+static Stmt *selection_stmt() {
     match(T_IF);
     match(T_LPAREN);
 
-    ExprVal cond;
-    expression(&cond);
+    Expr *cond = expression();
 
     match(T_RPAREN);
 
-    int cond_true = expr_to_bool(&cond);
+    Stmt *thenb = statement();
+    Stmt *elseb = NULL;
 
-    if (!exec) {
-        /* Already in a skipped context: parse both branches with exec=0 */
-        statement(0);
-        if (lookahead == T_ELSE) {
-            match(T_ELSE);
-            statement(0);
-        }
-        return;
+    if (lookahead == T_ELSE) {
+        match(T_ELSE);
+        elseb = statement();
     }
 
-    if (cond_true) {
-        /* Execute then-branch, skip else-branch if present */
-        statement(1);
-        if (lookahead == T_ELSE) {
-            match(T_ELSE);
-            statement(0);   /* parse but do not execute else */
-        }
-    } else {
-        /* Skip then-branch, execute else-branch (if present) */
-        statement(0);
-        if (lookahead == T_ELSE) {
-            match(T_ELSE);
-            statement(1);
-        }
-    }
+    if (thenb->kind != STMT_BLOCK)
+        thenb = make_block_stmt(thenb);
+    if (elseb && elseb->kind != STMT_BLOCK)
+        elseb = make_block_stmt(elseb);
+
+    return make_if_stmt(cond, thenb, elseb);
 }
 
-/* iteration-stmt → while ( expression ) statement
- *
- * NOTE: Because this is a single-pass interpreter that executes during parsing,
- * we cannot "loop back" over the input without building an explicit tree or
- * re-reading the source. For simplicity, we execute the loop body at most once.
- * You can extend this to full loop semantics later if needed.
- */
-static void iteration_stmt(int exec) {
+static Stmt *iteration_stmt() {
     match(T_WHILE);
     match(T_LPAREN);
 
-    ExprVal cond;
-    expression(&cond);
+    Expr *cond = expression();
 
     match(T_RPAREN);
 
-    int cond_true = expr_to_bool(&cond);
+    Stmt *body = statement();
 
-    if (!exec || !cond_true) {
-        /* Not executing at all, or condition false: parse body, no side effects */
-        statement(0);
-    } else {
-        /* Condition true and exec=1: execute body once */
-        statement(1);
-    }
+    if (body->kind != STMT_BLOCK)
+        body = make_block_stmt(body);
+
+    return make_while_stmt(cond, body);
 }
 
-/* expression → additive-expression [ relop additive-expression ]
- *
- * The result of a relational expression is of type int (0 or 1).
- */
-static void expression(ExprVal *out) {
-    ExprVal left;
-    additive_expression(&left);
+static Expr *expression() {
+    Expr *left = additive_expression();
 
-    /* Check for relational operator */
-    if (lookahead == T_EQ  || lookahead == T_NEQ ||
-        lookahead == T_LT  || lookahead == T_LTE ||
-        lookahead == T_GT  || lookahead == T_GTE) {
+    if (lookahead==T_EQ || lookahead==T_NEQ ||
+        lookahead==T_LT || lookahead==T_LTE ||
+        lookahead==T_GT || lookahead==T_GTE) {
 
-        int op = lookahead;
+        int op_tok = lookahead;
         match(lookahead);
 
-        ExprVal right;
-        additive_expression(&right);
+        Expr *right = additive_expression();
+        if (left->type != right->type)
+            semantic_error("Relational type mismatch");
 
-        ensure_same_type(&left, &right);
-
-        out->type = TYPE_INT;
-
-        switch (op) {
-            case T_EQ:  out->fval = (left.fval == right.fval); break;
-            case T_NEQ: out->fval = (left.fval != right.fval); break;
-            case T_LT:  out->fval = (left.fval <  right.fval); break;
-            case T_LTE: out->fval = (left.fval <= right.fval); break;
-            case T_GT:  out->fval = (left.fval >  right.fval); break;
-            case T_GTE: out->fval = (left.fval >= right.fval); break;
+        BinOpKind op;
+        switch (op_tok) {
+            case T_EQ:  op = OP_EQ; break;
+            case T_NEQ: op = OP_NEQ; break;
+            case T_LT:  op = OP_LT; break;
+            case T_LTE: op = OP_LTE; break;
+            case T_GT:  op = OP_GT; break;
+            case T_GTE: op = OP_GTE; break;
+            default: semantic_error("Bad relational op");
         }
-    } else {
-        /* Just an additive expression */
-        *out = left;
+
+        return make_binop_expr(op, TYPE_INT, left, right);
     }
+
+    return left;
 }
 
-/* additive-expression → term { (+|-) term } */
-static void additive_expression(ExprVal *out) {
-    ExprVal left;
-    term(&left);
+static Expr *additive_expression() {
+    Expr *left = term();
 
     while (lookahead == T_PLUS || lookahead == T_MINUS) {
-        int op = lookahead;
+        int op_tok = lookahead;
         match(lookahead);
 
-        ExprVal right;
-        term(&right);
+        Expr *right = term();
 
-        ensure_same_type(&left, &right);
+        if (left->type != right->type)
+            semantic_error("Additive type mismatch");
 
-        if (left.type == TYPE_INT) {
-            int li = (int)left.fval;
-            int ri = (int)right.fval;
-            left.fval = (op == T_PLUS) ? (li + ri) : (li - ri);
-        } else { /* TYPE_FLOAT */
-            left.fval = (op == T_PLUS)
-                        ? (left.fval + right.fval)
-                        : (left.fval - right.fval);
-        }
+        BinOpKind op = (op_tok==T_PLUS) ? OP_ADD : OP_SUB;
+
+        left = make_binop_expr(op, left->type, left, right);
     }
 
-    *out = left;
+    return left;
 }
 
-/* term → factor { (*|/) factor } */
-static void term(ExprVal *out) {
-    ExprVal left;
-    factor(&left);
+static Expr *term() {
+    Expr *left = factor();
 
     while (lookahead == T_MULT || lookahead == T_DIV) {
-        int op = lookahead;
+        int op_tok = lookahead;
         match(lookahead);
 
-        ExprVal right;
-        factor(&right);
+        Expr *right = factor();
 
-        ensure_same_type(&left, &right);
+        if (left->type != right->type)
+            semantic_error("Term type mismatch");
 
-        if (left.type == TYPE_INT) {
-            int li = (int)left.fval;
-            int ri = (int)right.fval;
-            if (op == T_MULT) {
-                left.fval = li * ri;
-            } else {
-                if (ri == 0) {
-                    semantic_error("Division by zero");
-                }
-                left.fval = li / ri; /* integer division */
-            }
-        } else { /* TYPE_FLOAT */
-            if (op == T_MULT) {
-                left.fval = left.fval * right.fval;
-            } else {
-                if (right.fval == 0.0f) {
-                    semantic_error("Division by zero");
-                }
-                left.fval = left.fval / right.fval;
-            }
-        }
+        BinOpKind op = (op_tok==T_MULT) ? OP_MUL : OP_DIV;
+
+        left = make_binop_expr(op, left->type, left, right);
     }
 
-    *out = left;
+    return left;
 }
 
-/* factor → ( expression ) | ID | NUM */
-static void factor(ExprVal *out) {
+static Expr *factor() {
     if (lookahead == T_LPAREN) {
         match(T_LPAREN);
-        expression(out);
+        Expr *e = expression();
         match(T_RPAREN);
-    } else if (lookahead == T_ID) {
+        return e;
+    }
+
+    if (lookahead == T_ID) {
         char name[64];
-        strncpy(name, yytext, sizeof(name) - 1);
-        name[sizeof(name) - 1] = '\0';
+        strcpy(name, yytext);
         match(T_ID);
+        return make_var_expr(name);
+    }
 
-        Symbol *sym = st_lookup(name);
-
-        out->type = sym->type;
-        if (sym->type == TYPE_INT) {
-            out->fval = (float)st_get_int(sym);
-        } else {
-            out->fval = st_get_float(sym);
-        }
-    } else if (lookahead == T_NUM) {
-        /* Convert lexeme to numeric value BEFORE matching, because match() advances */
+    if (lookahead == T_NUM) {
         char buf[64];
-        strncpy(buf, yytext, sizeof(buf) - 1);
-        buf[sizeof(buf) - 1] = '\0';
+        strcpy(buf, yytext);
         match(T_NUM);
 
-        /* Decide type: if it contains '.', treat as float; otherwise int */
         int is_float = (strchr(buf, '.') != NULL);
-
-        if (is_float) {
-            out->type = TYPE_FLOAT;
-            out->fval = (float)atof(buf);
-        } else {
-            out->type = TYPE_INT;
-            out->fval = (float)atoi(buf);
-        }
-    } else {
-        syntax_error("factor");
+        if (is_float)
+            return make_num_expr(TYPE_FLOAT, atof(buf));
+        else
+            return make_num_expr(TYPE_INT, atoi(buf));
     }
+
+    syntax_error("factor");
+    return NULL;
 }
 
-/* ======== main driver ======== */
+/* ------------------ main ------------------ */
 
 int main(int argc, char **argv) {
+
     if (argc > 1) {
         yyin = fopen(argv[1], "r");
         if (!yyin) {
-            fprintf(stderr, "Cannot open input file '%s'\n", argv[1]);
-            return EXIT_FAILURE;
+            fprintf(stderr, "Cannot open '%s'\n", argv[1]);
+            exit(1);
         }
-    } else {
-        yyin = stdin;
     }
 
     st_init();
 
-    advance();      /* initialize lookahead */
-    program_();     /* start symbol */
+    advance();
+    program_();
 
-    if (lookahead != T_EOF) {
+    if (lookahead != T_EOF)
         syntax_error("EOF");
-    }
 
-    printf("Interpretation completed successfully.\n");
+    printf("Interpretation completed.\n");
     st_print_all();
 
-    if (yyin && yyin != stdin) {
-        fclose(yyin);
-    }
-    return EXIT_SUCCESS;
+    if (yyin && yyin!=stdin) fclose(yyin);
+
+    return 0;
 }
